@@ -1,0 +1,35 @@
+name: Windows build
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Publish portable app
+        shell: powershell
+        run: .\build.ps1 -Publish
+      - name: Run self-tests
+        shell: powershell
+        run: |
+          $test = Start-Process -FilePath .\dist\Stoplight.exe -ArgumentList '--self-test --output artifacts\self-test.json' -Wait -PassThru
+          Get-Content .\artifacts\self-test.json
+          if ($test.ExitCode -ne 0) { throw 'Self-tests failed.' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Stoplight-win-x64
+          path: |
+            dist/Stoplight.exe
+            Start-Stoplight.cmd
+            README.md
+            docs/
+            artifacts/self-test.json

@@ -1,0 +1,9 @@
+.tools/
+**/bin/
+**/obj/
+dist/
+data/
+artifacts/
+*.user
+FEASIBILITY.md
+.vs/
