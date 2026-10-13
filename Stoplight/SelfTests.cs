@@ -35,6 +35,120 @@ internal static class SelfTests
             Assert(store.Patch("local", "chat", "owner", 1, 2, changes)); Assert(store.View().Running == 0 && store.View().Unread == 1);
             store.Read("local", "chat", false); Assert(store.View().Unread == 0);
         });
+        Check("Finished unread excludes active, waiting, failed, and already-read chats", () =>
+        {
+            var store = new ChatStore(); store.Connection(true, "test");
+            foreach (var (id, status) in new[] { ("finished", "completed"), ("running", "inProgress"), ("waiting", "inProgress"), ("failed", "failed") })
+            {
+                var state = State(status); state["hasUnreadTurn"] = true;
+                if (id == "waiting") state["threadRuntimeStatus"]!["activeFlags"] = new JsonArray("waitingOnUserInput");
+                store.Snapshot("local", id, "owner", 1, state);
+            }
+            store.Snapshot("local", "read", "owner", 1, State("completed"));
+            var view = store.View();
+            Assert(view.FinishedUnread == 1 && view.AwaitingInput == 1 && view.Running == 1 && view.Errors == 1);
+            Assert(view.Chats.Single(c => c.FinishedUnread).Id == "finished");
+            Assert(view.Chats.Single(c => c.AwaitingInput).Id == "waiting");
+            Assert(view.Chats.Single(c => c.Running).Id == "running");
+            store.Read("local", "finished", false); Assert(store.View().FinishedUnread == 0);
+        });
+        Check("Approval and input requests move from running to waiting and back", () =>
+        {
+            foreach (var flag in new[] { "waitingOnApproval", "waitingOnUserInput" })
+            {
+                var store = new ChatStore(); store.Snapshot("local", "chat", "owner", 1, State("inProgress"));
+                Assert(store.View().Running == 1 && store.View().AwaitingInput == 0);
+                var changes = new JsonArray(new JsonObject { ["op"] = "replace", ["path"] = new JsonArray("threadRuntimeStatus", "activeFlags"), ["value"] = new JsonArray(flag) });
+                Assert(store.Patch("local", "chat", "owner", 1, 2, changes));
+                Assert(store.View().Running == 0 && store.View().AwaitingInput == 1 && store.View().FinishedUnread == 0);
+                changes[0]!["value"] = new JsonArray();
+                Assert(store.Patch("local", "chat", "owner", 2, 3, changes));
+                Assert(store.View().Running == 1 && store.View().AwaitingInput == 0);
+                var finished = State("completed"); finished["hasUnreadTurn"] = true;
+                store.Snapshot("local", "chat", "owner", 4, finished);
+                Assert(store.View().FinishedUnread == 1 && store.View().Running == 0 && store.View().AwaitingInput == 0);
+            }
+        });
+        Check("Saved unread replies count green while saved errors are excluded", () =>
+        {
+            var store = new ChatStore();
+            store.Seed([new("finished", "Finished", "", "", 1, false), new("failed", "Failed", "", "", 1, false)], new HashSet<string> { "finished", "failed" });
+            store.RestoreSavedState("finished", new("turn", false, true, true), false);
+            store.RestoreError("failed", true);
+            Assert(store.View().FinishedUnread == 1 && store.View().AwaitingInput == 0 && store.View().Running == 0);
+        });
+        Check("Cold-start unread requires successful completion evidence", () =>
+        {
+            foreach (var eventType in new[] { "task_started", "task_complete", "turn_aborted", "error", "unknown" })
+            {
+                var path = Path.Combine(Path.GetTempPath(), "stoplight-fixture-" + Guid.NewGuid().ToString("N") + ".jsonl");
+                try
+                {
+                    File.WriteAllText(path, JsonSerializer.Serialize(new { type = "event_msg", payload = new { type = eventType, turn_id = "turn", will_retry = false } }) + "\n");
+                    var store = new ChatStore();
+                    store.Seed([new("chat", "Title", "", path, 1, false)], new HashSet<string> { "chat" });
+                    Assert(store.View().FinishedUnread == 0);
+                    var result = LocalData.ReadLatestState(path)!;
+                    store.RestoreSavedState("chat", result, LocalData.ResolveError(null, result, 1));
+                    Assert(store.View().FinishedUnread == (eventType == "task_complete" ? 1 : 0));
+                    Assert(store.View().Running == 0 && store.View().AwaitingInput == 0);
+                }
+                finally { File.Delete(path); }
+            }
+        });
+        Check("Saved completion after disconnect recovers green; a newer unfinished turn clears it", () =>
+        {
+            var store = new ChatStore(); var active = State("inProgress"); active["hasUnreadTurn"] = true;
+            store.Seed([new("chat", "Title", "", "", 1, false)], null);
+            store.Snapshot("local", "chat", "owner", 1, active); store.OwnerDisconnected("owner");
+            store.Seed([new("chat", "Title", "", "", 2, false)], new HashSet<string> { "chat" });
+            store.RestoreSavedState("chat", new("one", false, true, true), false);
+            Assert(store.View().FinishedUnread == 1);
+            store.Seed([new("chat", "Title", "", "", 3, false)], new HashSet<string> { "chat" });
+            Assert(store.View().FinishedUnread == 0);
+            store.RestoreSavedState("chat", new("two", false, false, false), false);
+            Assert(store.View().FinishedUnread == 0);
+            // Completion can happen within the same metadata timestamp second.
+            store.RestoreSavedState("chat", new("two", false, true, true), false);
+            Assert(store.View().FinishedUnread == 1);
+        });
+        Check("Saved evidence supports idle summaries without overwriting live turns", () =>
+        {
+            var store = new ChatStore(); store.Seed([new("chat", "Title", "", "", 1, false)], new HashSet<string> { "chat" });
+            var summary = State("completed"); summary.Remove("turnHistory"); summary["hasUnreadTurn"] = true;
+            store.Snapshot("local", "chat", "owner", 1, summary);
+            store.RestoreSavedState("chat", new("one", false, true, true), false);
+            Assert(store.View().FinishedUnread == 1);
+            store.Snapshot("local", "chat", "owner", 2, summary); Assert(store.View().FinishedUnread == 1);
+            var active = State("inProgress"); active["hasUnreadTurn"] = true;
+            store.Snapshot("local", "chat", "owner", 3, active);
+            store.RestoreSavedState("chat", new("old", false, true, true), false);
+            Assert(store.View().FinishedUnread == 0 && store.View().Running == 1);
+        });
+        Check("Read broadcasts survive unrelated patches and explicit unread patches still apply", () =>
+        {
+            var store = new ChatStore(); var state = State("completed"); state["hasUnreadTurn"] = true;
+            store.Snapshot("local", "chat", "owner", 1, state); store.Read("local", "chat", false);
+            Assert(store.Patch("local", "chat", "owner", 1, 2, JsonNode.Parse("""[{"op":"replace","path":["title"],"value":"Renamed"}]""")!.AsArray()));
+            Assert(store.View().FinishedUnread == 0 && store.View().Unread == 0);
+            store.Read("local", "chat", true);
+            Assert(store.Patch("local", "chat", "owner", 2, 3, JsonNode.Parse("""[{"op":"replace","path":["title"],"value":"Renamed again"}]""")!.AsArray()));
+            Assert(store.View().FinishedUnread == 1);
+            Assert(store.Patch("local", "chat", "owner", 3, 4, JsonNode.Parse("""[{"op":"replace","path":["hasUnreadTurn"],"value":false}]""")!.AsArray()));
+            Assert(store.View().FinishedUnread == 0);
+        });
+        Check("Disconnect clears waiting without misclassifying an unfinished unread turn", () =>
+        {
+            foreach (var disconnectOwner in new[] { false, true })
+            {
+                var store = new ChatStore(); var state = State("inProgress"); state["hasUnreadTurn"] = true;
+                state["threadRuntimeStatus"]!["activeFlags"] = new JsonArray("waitingOnApproval");
+                store.Snapshot("local", "chat", "owner", 1, state);
+                Assert(store.View().AwaitingInput == 1 && store.View().FinishedUnread == 0);
+                if (disconnectOwner) store.OwnerDisconnected("owner"); else store.Connection(false, "Disconnected");
+                Assert(store.View().AwaitingInput == 0 && store.View().Running == 0 && store.View().FinishedUnread == 0);
+            }
+        });
         Check("Terminal errors count; retryable and older errors do not", () =>
         {
             var store = new ChatStore(); var state = State("completed");
@@ -143,11 +257,24 @@ internal static class SelfTests
                 while (J.Text(follow["params"]?["conversationId"]) != "test-chat");
                 Assert(savedChats.All(c => subscribed.Contains(c.Id)));
                 Assert(J.Text(follow["method"]) == "thread-stream-following-changed");
+                var snapshot = State(round == 0 ? "inProgress" : "completed"); snapshot["hasUnreadTurn"] = round == 1;
                 await Frames.Write(server, Broadcast("thread-stream-state-changed", 11, new JsonObject { ["hostId"] = "local", ["conversationId"] = "test-chat",
-                    ["change"] = new JsonObject { ["type"] = "snapshot", ["revision"] = 1, ["conversationState"] = State(round == 0 ? "inProgress" : "completed") } }), timeout.Token);
+                    ["change"] = new JsonObject { ["type"] = "snapshot", ["revision"] = 1, ["conversationState"] = snapshot } }), timeout.Token);
                 phase = "snapshot round " + round;
                 await Wait(() => monitor.Store.View().Chats.Any(c => c.Id == "test-chat" && c.Live && c.Running == (round == 0)), timeout.Token);
                 if (round == 0) { phase = "disconnect round " + round; server.Disconnect(); await Wait(() => !monitor.Store.View().Connected, timeout.Token); }
+                else
+                {
+                    phase = "read broadcast and unrelated patch";
+                    await Wait(() => monitor.Store.View().FinishedUnread == 1, timeout.Token);
+                    await Frames.Write(server, Broadcast("thread-read-state-changed", 3, new JsonObject { ["hostId"] = "local", ["conversationId"] = "test-chat", ["hasUnreadTurn"] = false }), timeout.Token);
+                    await Wait(() => monitor.Store.View().FinishedUnread == 0, timeout.Token);
+                    await Frames.Write(server, Broadcast("thread-stream-state-changed", 11, new JsonObject { ["hostId"] = "local", ["conversationId"] = "test-chat",
+                        ["change"] = new JsonObject { ["type"] = "patches", ["baseRevision"] = 1, ["revision"] = 2,
+                            ["patches"] = JsonNode.Parse("""[{"op":"replace","path":["title"],"value":"Renamed"}]""") } }), timeout.Token);
+                    await Wait(() => monitor.Store.View().Patches == 1, timeout.Token);
+                    Assert(monitor.Store.View().FinishedUnread == 0);
+                }
             }
             }
             catch (OperationCanceledException e)
@@ -172,9 +299,9 @@ internal static class SelfTests
             ["islands"] = new JsonArray(new JsonObject { ["entries"] = new JsonArray(new JsonObject { ["value"] = "turn-1" }) })
         } }
     };
-    public static MonitorView SampleView() => new(true, "Connected to Codex in VS Code", null, 2, 1, 1, 4, 5, 120, 2,
-    [new("local:one", "one", "local", "Build the Stoplight tray app", "D:\\stoplight", true, true, false, false, "Running", DateTimeOffset.UtcNow),
-     new("local:two", "two", "local", "Review the authentication changes", "D:\\projects\\portal", true, true, false, false, "Running", DateTimeOffset.UtcNow),
-     new("local:three", "three", "local", "Fix the dashboard layout", "D:\\projects\\portal", true, false, true, false, "Unread reply", DateTimeOffset.UtcNow),
+    public static MonitorView SampleView() => new(true, "Connected to Codex in VS Code", null, 1, 1, 1, 4, 5, 120, 2,
+    [new("local:one", "one", "local", "Build the Stoplight tray app", "D:\\stoplight", true, true, false, false, "Still running", DateTimeOffset.UtcNow),
+     new("local:two", "two", "local", "Review the authentication changes", "D:\\projects\\portal", true, false, false, false, "Awaiting user input", DateTimeOffset.UtcNow, AwaitingInput: true),
+     new("local:three", "three", "local", "Fix the dashboard layout", "D:\\projects\\portal", true, false, true, false, "Finished and unread", DateTimeOffset.UtcNow, FinishedUnread: true),
      new("local:four", "four", "local", "Run the release checks", "D:\\projects\\tools", true, false, false, true, "Error", DateTimeOffset.UtcNow)]);
 }

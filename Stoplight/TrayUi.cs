@@ -59,11 +59,11 @@ internal sealed class Dashboard : Form
         {
             cards.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.333f));
             var panel = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Surface, Margin = new Padding(i == 0 ? 0 : 8, 0, 0, 0), Cursor = Cursors.Hand };
-            var color = new[] { Theme.Green, Theme.Amber, Theme.Red }[i];
-            var title = new Label { Text = new[] { "RUNNING", "UNREAD REPLIES", "ERRORS" }[i], AutoSize = true, ForeColor = color, Location = new Point(15, 12), Font = new Font("Segoe UI", 9, FontStyle.Bold) };
+            var color = new[] { Theme.Green, Theme.Red, Theme.Amber }[i];
+            var title = new Label { Text = new[] { "FINISHED AND UNREAD", "AWAITING USER INPUT", "STILL RUNNING" }[i], AutoSize = true, ForeColor = color, Location = new Point(15, 12), Font = new Font("Segoe UI", 9, FontStyle.Bold) };
             counts[i].SetBounds(12, 31, 240, 49); counts[i].Font = new Font("Segoe UI", 27, FontStyle.Bold); counts[i].ForeColor = Theme.Text;
             panel.Controls.Add(title); panel.Controls.Add(counts[i]); cards.Controls.Add(panel, i, 0);
-            var choice = new[] { "running", "unread", "error" }[i];
+            var choice = new[] { "finished", "waiting", "running" }[i];
             void ClickCard(object? sender, EventArgs args) { SetFilter(filter == choice ? "all" : choice); }
             panel.Click += ClickCard; title.Click += ClickCard; counts[i].Click += ClickCard;
         }
@@ -103,8 +103,9 @@ internal sealed class Dashboard : Form
     {
         current = view; connection.Text = view.Connection + (view.Connected ? $" · {view.LiveChats} live chats" : "");
         connection.ForeColor = view.Connected ? Theme.Green : Theme.Muted;
-        counts[0].Text = view.Connected ? view.Running.ToString() : "–";
-        counts[1].Text = view.Unread.ToString(); counts[2].Text = view.Connected ? view.Errors.ToString() : "–";
+        counts[0].Text = view.FinishedUnread.ToString();
+        counts[1].Text = view.Connected ? view.AwaitingInput.ToString() : "–";
+        counts[2].Text = view.Connected ? view.Running.ToString() : "–";
         note.Text = view.Warning ?? (filter == "all" ? "Main Codex chats · local VS Code windows · subagents excluded" : $"Showing {filter} chats · click the card again to clear");
         var signature = filter + history.Checked + search.Text + string.Join("|", view.Chats.Select(c => c.Key + c.Status + c.Title + c.Cwd + c.Live));
         if (signature != lastSignature) { lastSignature = signature; Rebuild(); }
@@ -115,13 +116,13 @@ internal sealed class Dashboard : Form
         if (current == null) return;
         var selected = grid.SelectedRows.Count > 0 ? (grid.SelectedRows[0].Tag as ChatView)?.Key : null;
         var rows = current.Chats.Where(c => history.Checked || c.Live || c.Unread || c.Error).Where(c => filter switch
-            { "running" => c.Running, "unread" => c.Unread, "error" => c.Error, _ => true })
+            { "finished" => c.FinishedUnread, "waiting" => c.AwaitingInput, "running" => c.Running, _ => true })
             .Where(c => c.Title.Contains(search.Text, StringComparison.OrdinalIgnoreCase) || c.Cwd.Contains(search.Text, StringComparison.OrdinalIgnoreCase)).Take(500);
         grid.Rows.Clear();
         foreach (var chat in rows)
         {
             var index = grid.Rows.Add(chat.Status, chat.Title, chat.Cwd); var row = grid.Rows[index]; row.Tag = chat;
-            row.Cells[0].Style.ForeColor = chat.Error ? Theme.Red : chat.Running ? Theme.Green : chat.Unread ? Theme.Amber : Theme.Muted;
+            row.Cells[0].Style.ForeColor = chat.AwaitingInput ? Theme.Red : chat.Running ? Theme.Amber : chat.FinishedUnread ? Theme.Green : Theme.Muted;
             row.Cells[1].ToolTipText = chat.Title; row.Cells[2].ToolTipText = chat.Cwd;
             if (chat.Key == selected) row.Selected = true;
         }
@@ -138,9 +139,9 @@ internal sealed class TrayApp : ApplicationContext
 {
     private readonly IpcMonitor monitor = new();
     private readonly NotifyIcon[] icons = [new(), new(), new()];
-    private readonly Color[] colors = [Theme.Green, Theme.Amber, Theme.Red];
-    private readonly string[] labels = ["Running", "Unread replies", "Errors"];
-    private readonly string[] filters = ["running", "unread", "error"];
+    private readonly Color[] colors = [Theme.Green, Theme.Red, Theme.Amber];
+    private readonly string[] labels = ["Finished and unread", "Awaiting user input", "Still running"];
+    private readonly string[] filters = ["finished", "waiting", "running"];
     private readonly System.Windows.Forms.Timer timer = new() { Interval = 500 };
     private readonly Dashboard dashboard = new();
     private readonly ToolStripMenuItem[] countItems = [new(), new(), new()];
@@ -168,7 +169,7 @@ internal sealed class TrayApp : ApplicationContext
     private void Update()
     {
         var view = monitor.Store.View(); statusItem.Text = view.Connection;
-        int?[] values = [view.Connected ? view.Running : null, view.Unread, view.Connected ? view.Errors : null];
+        int?[] values = [view.FinishedUnread, view.Connected ? view.AwaitingInput : null, view.Connected ? view.Running : null];
         for (var i = 0; i < 3; i++)
         {
             var text = $"Stoplight · {labels[i]}: {(values[i]?.ToString() ?? "unknown")} · {(view.Connected ? "VS Code" : "disconnected")}";
@@ -181,7 +182,8 @@ internal sealed class TrayApp : ApplicationContext
         }
         if (dashboard.Visible) dashboard.UpdateView(view);
         var status = System.Text.Json.JsonSerializer.Serialize(new { view.Connected, view.Connection, view.Warning,
-            view.Running, view.Unread, view.Errors, view.LiveChats, TrayIcons = icons.Count(i => i.Visible) });
+            view.FinishedUnread, view.AwaitingInput, view.Running, view.Unread, view.Errors, view.LiveChats,
+            TrayIcons = icons.Count(i => i.Visible) });
         if (status != lastStatus)
         {
             try { Directory.CreateDirectory(Paths.Data); File.WriteAllText(Path.Combine(Paths.Data, "status.json"), status); lastStatus = status; }

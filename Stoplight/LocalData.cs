@@ -6,7 +6,7 @@ using System.Text.Json.Nodes;
 namespace Stoplight;
 
 internal sealed record SavedError(string TurnId, long ObservedAt);
-internal sealed record RolloutResult(string TurnId, bool? Error, bool Completed);
+internal sealed record RolloutResult(string TurnId, bool? Error, bool Completed, bool? Finished = null);
 
 internal static class Paths
 {
@@ -91,16 +91,16 @@ internal static class LocalData
         }
         return found ? unread : null;
     }
-    // Restore only terminal error evidence from the end of an existing transcript.
+    // Restore lifecycle evidence from the end of an existing transcript.
     // Never treat an unfinished historical turn as a currently running process.
-    public static RolloutResult? ReadLatestError(string path)
+    public static RolloutResult? ReadLatestState(string path)
     {
         if (!File.Exists(path)) return null;
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
         var offset = Math.Max(0, stream.Length - 256 * 1024); stream.Position = offset;
         using var reader = new StreamReader(stream, Encoding.UTF8);
         if (offset > 0) reader.ReadLine();
-        bool? error = null; var turnId = ""; var completed = false;
+        bool? error = null, finished = null; var turnId = ""; var completed = false;
         while (reader.ReadLine() is { } line)
         {
             try
@@ -112,16 +112,18 @@ internal static class LocalData
                 {
                     case "task_started": case "task_complete": case "turn_aborted":
                         error = false; completed = type.GetString() != "task_started";
+                        finished = type.GetString() == "task_complete";
                         turnId = p.TryGetProperty("turn_id", out var id) ? id.GetString() ?? "" : "";
                         break;
                     case "error":
-                        if ((p.TryGetProperty("will_retry", out var retry) || p.TryGetProperty("willRetry", out retry)) && retry.ValueKind == JsonValueKind.False) error = true;
+                        if ((p.TryGetProperty("will_retry", out var retry) || p.TryGetProperty("willRetry", out retry)) && retry.ValueKind == JsonValueKind.False)
+                        { error = true; finished = false; }
                         break;
                 }
             }
             catch (JsonException) { /* A concurrently appended last line may be incomplete. */ }
         }
-        return new(turnId, error, completed);
+        return new(turnId, error, completed, finished);
     }
 }
 

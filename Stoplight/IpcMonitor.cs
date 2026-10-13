@@ -67,16 +67,16 @@ internal sealed class IpcMonitor : IDisposable
                 {
                     var hasSaved = restored.TryGetValue(row.Id, out var saved);
                     if (hasSaved) Store.RestoreError(row.Id, true, saved!.TurnId);
-                    if (!checkedErrors.TryGetValue(row.Id, out var updated) || updated != row.Updated)
+                    if (!checkedErrors.TryGetValue(row.Id, out var updated) || updated != row.Updated ||
+                        unread?.Contains(row.Id) == true)
                     {
                         try
                         {
-                            if (LocalData.ReadLatestError(row.Rollout) is { } result)
+                            if (LocalData.ReadLatestState(row.Rollout) is { } result)
                             {
                                 // A failed turn may only persist its start event. Keep the observed
                                 // failure until completion or a different turn provides newer evidence.
-                                if (LocalData.ResolveError(saved, result, row.Updated) is { } error)
-                                    Store.RestoreError(row.Id, error, result.TurnId);
+                                Store.RestoreSavedState(row.Id, result, LocalData.ResolveError(saved, result, row.Updated));
                             }
                         }
                         catch (IOException) { }

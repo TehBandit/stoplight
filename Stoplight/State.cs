@@ -11,15 +11,23 @@ internal static class J
 
 internal sealed record ChatMetadata(string Id, string Title, string Cwd, string Rollout, long Updated, bool Archived);
 internal sealed record ChatView(string Key, string Id, string Host, string Title, string Cwd, bool Live,
-    bool Running, bool Unread, bool Error, string Status, DateTimeOffset Updated, string LatestTurnId = "");
+    bool Running, bool Unread, bool Error, string Status, DateTimeOffset Updated, string LatestTurnId = "",
+    bool AwaitingInput = false, bool FinishedUnread = false);
 internal sealed record MonitorView(bool Connected, string Connection, string? Warning, int Running, int Unread,
-    int Errors, int LiveChats, long Snapshots, long Patches, long ReadChanges, IReadOnlyList<ChatView> Chats);
+    int Errors, int LiveChats, long Snapshots, long Patches, long ReadChanges, IReadOnlyList<ChatView> Chats)
+{
+    public int FinishedUnread => Chats.Count(c => c.FinishedUnread);
+    public int AwaitingInput => Chats.Count(c => c.AwaitingInput);
+}
 
 internal sealed class ChatEntry
 {
     public required string Id;
     public string Host = "local", Title = "Codex chat", Cwd = "", Owner = "", Runtime = "unknown";
     public bool Eligible, Archived, Live, Unread, Error, Running;
+    // Unread alone is not completion evidence: approval requests can also be unread.
+    public bool Finished, HasTurnState;
+    public long SavedUpdated;
     public bool Seeded, Excluded;
     public string LatestTurnId = "";
     public DateTimeOffset Updated = DateTimeOffset.UtcNow;
@@ -71,7 +79,9 @@ internal sealed class ChatStore
             { c.Archived = true; c.Live = false; c.Running = false; c.State = null; }
             foreach (var m in records)
             {
-                var c = Get("local", m.Id); c.Eligible = !c.Excluded; c.Archived = m.Archived; c.Seeded = true;
+                var c = Get("local", m.Id);
+                if (!c.Live && c.Seeded && c.SavedUpdated != m.Updated) c.Finished = false;
+                c.SavedUpdated = m.Updated; c.Eligible = !c.Excluded; c.Archived = m.Archived; c.Seeded = true;
                 if (c.State == null) { c.Title = m.Title; c.Cwd = m.Cwd; c.Updated = DateTimeOffset.FromUnixTimeSeconds(m.Updated); }
                 // Refresh persisted read state only for chats with no live owner; broadcasts win for live chats.
                 if (unread != null && !c.Live) c.Unread = unread.Contains(m.Id);
@@ -86,9 +96,27 @@ internal sealed class ChatStore
             if (!c.Live) { c.Error = error; if (!string.IsNullOrEmpty(turnId)) c.LatestTurnId = turnId; }
         }
     }
+    public void RestoreSavedState(string id, RolloutResult result, bool? error)
+    {
+        lock (gate)
+        {
+            var c = Get("local", id);
+            // A live turn is authoritative; an idle summary without history can use saved evidence.
+            if (c.Live && (c.HasTurnState || c.Running || c.Error)) return;
+            if (error is { } failed) c.Error = failed;
+            if (result.Finished is { } finished) c.Finished = finished;
+            if (!string.IsNullOrEmpty(result.TurnId)) c.LatestTurnId = result.TurnId;
+        }
+    }
     public void Read(string host, string id, bool unread)
     {
-        lock (gate) { Get(host, id).Unread = unread; readChanges++; }
+        lock (gate)
+        {
+            var c = Get(host, id); c.Unread = unread;
+            // Read broadcasts may not be repeated in stream patches. Keep the patch base current.
+            if (c.State is JsonObject state) state["hasUnreadTurn"] = unread;
+            readChanges++;
+        }
     }
     public void Archive(string host, string id, bool archived) { lock (gate) Get(host, id).Archived = archived; }
     public void OwnerDisconnected(string owner)
@@ -149,11 +177,14 @@ internal sealed class ChatStore
         else if (state["turns"] is JsonArray legacy) turns.AddRange(legacy.OfType<JsonNode>());
         var latest = turns.LastOrDefault(t => !string.IsNullOrEmpty(J.Text(t["turnId"])) || !string.IsNullOrEmpty(J.Text(t["status"])));
         var status = J.Text(latest?["status"]);
-        c.LatestTurnId = J.Text(latest?["turnId"]);
+        c.HasTurnState = latest != null;
+        if (latest != null) c.LatestTurnId = J.Text(latest["turnId"]);
         c.Running = c.Runtime == "active" || status == "inProgress";
         c.Error = c.Runtime == "systemError" || status == "failed" ||
             (latest?["items"] is JsonArray items && items.Any(i => J.Text(i?["type"]) == "error" &&
                 i?["willRetry"] is JsonValue retry && retry.TryGetValue<bool>(out var b) && !b));
+        if (latest != null || c.Running || c.Error)
+            c.Finished = status == "completed" && !c.Running && !c.Error;
         c.Updated = DateTimeOffset.UtcNow;
     }
     public MonitorView View()
@@ -162,10 +193,15 @@ internal sealed class ChatStore
         {
             var rows = chats.Select(x => (x.Key, Chat: x.Value)).Where(x => x.Chat.Eligible && !x.Chat.Archived)
                 .Select(x => { var c = x.Chat; var flags = c.State?["threadRuntimeStatus"]?["activeFlags"] as JsonArray;
-                    var waiting = flags?.Any(f => J.Text(f) is "waitingOnApproval" or "waitingOnUserInput") == true;
-                    var status = c.Error ? "Error" : c.Running ? waiting ? "Waiting for you" : "Running" : c.Unread ? "Unread reply" : c.Live ? "Ready" : "Saved chat";
-                    return new ChatView(x.Key, c.Id, c.Host, c.Title, c.Cwd, c.Live, c.Running, c.Unread, c.Error, status, c.Updated, c.LatestTurnId); })
-                .OrderByDescending(c => c.Running).ThenByDescending(c => c.Error).ThenByDescending(c => c.Unread).ThenByDescending(c => c.Updated).ToArray();
+                    var waiting = c.Live && c.Running && !c.Error &&
+                        flags?.Any(f => J.Text(f) is "waitingOnApproval" or "waitingOnUserInput") == true;
+                    var running = c.Running && !waiting && !c.Error;
+                    var finishedUnread = c.Finished && c.Unread && !c.Error;
+                    var status = c.Error ? "Error" : waiting ? "Awaiting user input" : running ? "Still running" : finishedUnread ? "Finished and unread" : c.Live ? "Ready" : "Saved chat";
+                    return new ChatView(x.Key, c.Id, c.Host, c.Title, c.Cwd, c.Live, running, c.Unread, c.Error,
+                        status, c.Updated, c.LatestTurnId, waiting, finishedUnread); })
+                .OrderByDescending(c => c.AwaitingInput).ThenByDescending(c => c.FinishedUnread)
+                .ThenByDescending(c => c.Running).ThenByDescending(c => c.Error).ThenByDescending(c => c.Updated).ToArray();
             return new(connected, connection, protocolWarning ?? warning, rows.Count(c => c.Running), rows.Count(c => c.Unread),
                 rows.Count(c => c.Error), rows.Count(c => c.Live), snapshots, patches, readChanges, rows);
         }

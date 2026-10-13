@@ -45,9 +45,9 @@ internal static class Program
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         await File.WriteAllTextAsync(path, JsonSerializer.Serialize(new
         {
-            v.Connected, v.Connection, v.Warning, v.Running, v.Unread, v.Errors, v.LiveChats,
+            v.Connected, v.Connection, v.Warning, v.FinishedUnread, v.AwaitingInput, v.Running, v.Unread, v.Errors, v.LiveChats,
             v.Snapshots, v.Patches, v.ReadChanges, SavedChats = v.Chats.Count,
-            LiveStates = v.Chats.Where(c => c.Live).Select(c => new { c.Status, c.Running, c.Unread, c.Error })
+            LiveStates = v.Chats.Where(c => c.Live).Select(c => new { c.Status, c.FinishedUnread, c.AwaitingInput, c.Running, c.Unread, c.Error })
         }, new JsonSerializerOptions { WriteIndented = true }));
     }
 }
