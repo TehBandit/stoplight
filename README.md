@@ -23,6 +23,10 @@ Each chat counts in at most one category. Stoplight tracks local, unarchived mai
 
 Stoplight reconnects automatically when VS Code restarts. Gray dashes mean waiting and running counts are unknown while disconnected. Confirmed finished unread replies remain available. Failed chats appear in the dashboard.
 
+## Works well with TrayBridge
+
+[TrayBridge](https://github.com/TehBandit/traybridge) brings Windows 11's native tray icons to additional monitors and lets you choose which icons appear on each display. It pairs well with Stoplight, keeping your chat status icons visible on the monitors where you work.
+
 ## Install on Windows
 
 **Requirements:** Windows x64, VS Code, and the OpenAI Codex extension. Windows 11 is recommended.
